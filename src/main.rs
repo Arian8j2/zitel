@@ -79,6 +79,7 @@ struct App {
 
     // lazy neighbour fetch
     neighbour_fetched: bool,
+    neighbour_fetching: bool,
 
     // traffic tracking (per‑dashboard request)
     last_dashboard_time: Option<Instant>,
@@ -123,6 +124,7 @@ impl App {
             status_message: String::new(),
             request_tx,
             neighbour_fetched: false,
+            neighbour_fetching: false,
             last_dashboard_time: None,
             prev_receive: None,
             prev_sent: None,
@@ -538,23 +540,30 @@ fn draw_neighbor_cells(f: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    let data = &app.neighbour_data;
-    let count = data["lenghtt"]
-        .as_str()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-
     let mut lines = vec![];
-    lines.push(Line::from(format!("Found {} neighbor cell(s)", count)));
-    for i in 1..=count {
-        lines.push(Line::from(""));
-        lines.push(Line::from(format!(" Cell {} ", i)));
-        add_line(&mut lines, "MCC", data, &format!("type{}", i));
-        add_line(&mut lines, "MNC", data, &format!("band{}", i));
-        add_line(&mut lines, "Band", data, &format!("pcid{}", i));
-        add_line(&mut lines, "ARFCN", data, &format!("rsrq{}", i));
-        add_line(&mut lines, "PCI", data, &format!("rsrp{}", i));
-        add_line(&mut lines, "Signal(dBm)", data, &format!("rsrppp{}", i));
+    if app.neighbour_fetching {
+        lines.push(Line::from("Searching neighbour cells..."));
+    } else if !app.neighbour_fetched {
+        lines.push(Line::from("Neighbour search may briefly disconnect Wi-Fi."));
+        lines.push(Line::from("Press Enter to start searching, or switch tabs to skip."));
+    } else {
+        let data = &app.neighbour_data;
+        let count = data["lenghtt"]
+            .as_str()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        lines.push(Line::from(format!("Found {} neighbor cell(s)", count)));
+        for i in 1..=count {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(" Cell {} ", i)));
+            add_line(&mut lines, "MCC", data, &format!("type{}", i));
+            add_line(&mut lines, "MNC", data, &format!("band{}", i));
+            add_line(&mut lines, "Band", data, &format!("pcid{}", i));
+            add_line(&mut lines, "ARFCN", data, &format!("rsrq{}", i));
+            add_line(&mut lines, "PCI", data, &format!("rsrp{}", i));
+            add_line(&mut lines, "Signal(dBm)", data, &format!("rsrppp{}", i));
+        }
     }
 
     let text = Text::from(lines);
@@ -732,10 +741,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Response::NeighborData { data, error } => {
+                    app.neighbour_fetching = false;
                     if let Some(e) = error {
                         app.status_message = format!("Neighbour error: {}", e);
                     } else {
                         app.neighbour_data = data;
+                        app.neighbour_fetched = true;
                         app.status_message = "Neighbour cells fetched".into();
                     }
                 }
@@ -781,15 +792,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                             KeyCode::Tab => {
                                 app.next_page();
-                                if matches!(app.page, Page::NeighborCells) && !app.neighbour_fetched
-                                {
-                                    app.neighbour_fetched = true;
-                                    send_request(
-                                        &app.request_tx,
-                                        &response_tx,
-                                        Request::FetchNeighbors,
-                                    );
-                                }
                             }
                             // Allow digits and dots only (simple IP input)
                             KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
@@ -804,36 +806,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     match key.code {
                         KeyCode::Tab => {
                             app.next_page();
-                            if matches!(app.page, Page::NeighborCells) && !app.neighbour_fetched {
-                                app.neighbour_fetched = true;
-                                send_request(
-                                    &app.request_tx,
-                                    &response_tx,
-                                    Request::FetchNeighbors,
-                                );
-                            }
                         }
                         KeyCode::BackTab => {
                             app.previous_page();
-                            if matches!(app.page, Page::NeighborCells) && !app.neighbour_fetched {
-                                app.neighbour_fetched = true;
-                                send_request(
-                                    &app.request_tx,
-                                    &response_tx,
-                                    Request::FetchNeighbors,
-                                );
-                            }
                         }
                         KeyCode::Char('1') => {
                             app.go_to_page(0);
-                            if matches!(app.page, Page::NeighborCells) && !app.neighbour_fetched {
-                                app.neighbour_fetched = true;
-                                send_request(
-                                    &app.request_tx,
-                                    &response_tx,
-                                    Request::FetchNeighbors,
-                                );
-                            }
                         }
                         KeyCode::Char('2') => app.go_to_page(1),
                         KeyCode::Char('3') => app.go_to_page(2),
@@ -861,7 +839,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                         KeyCode::Enter => {
-                            if let Page::BandLock = app.page {
+                            if matches!(app.page, Page::NeighborCells)
+                                && !app.neighbour_fetched
+                                && !app.neighbour_fetching
+                            {
+                                app.neighbour_fetching = true;
+                                app.status_message = "Searching neighbour cells...".into();
+                                send_request(
+                                    &app.request_tx,
+                                    &response_tx,
+                                    Request::FetchNeighbors,
+                                );
+                            } else if let Page::BandLock = app.page {
                                 let selected = app.band_lock_state.state.selected().unwrap_or(0);
                                 let earfcn = app.band_lock_state.items[selected].clone();
                                 send_request(
