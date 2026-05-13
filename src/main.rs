@@ -66,8 +66,6 @@ impl BandLockState {
 }
 
 struct App {
-    token: String,
-    auth_header: String,
     page: Page,
     index_data: Value,
     neighbour_data: Value,
@@ -77,7 +75,6 @@ struct App {
     dmz_ip_input: String,
     band_lock_state: BandLockState,
     status_message: String,
-    last_refresh_request: Instant,
     request_tx: mpsc::UnboundedSender<(Request, mpsc::UnboundedSender<Response>)>,
 
     // lazy neighbour fetch
@@ -101,26 +98,20 @@ struct App {
 enum Request {
     RefreshDashboard,
     FetchNeighbors,
-    SetBandLock { index: usize, earfcn: String },
+    SetBandLock { earfcn: String },
     SetDmz { ip: String },
 }
 
 enum Response {
     DashboardData { data: Value, error: Option<String> },
     NeighborData { data: Value, error: Option<String> },
-    BandLockResult { earfcn: String, result: String },
+    BandLockResult { result: String },
     DmzResult(String),
 }
 
 impl App {
-    fn new(
-        token: String,
-        auth_header: String,
-        request_tx: mpsc::UnboundedSender<(Request, mpsc::UnboundedSender<Response>)>,
-    ) -> Self {
+    fn new(request_tx: mpsc::UnboundedSender<(Request, mpsc::UnboundedSender<Response>)>) -> Self {
         Self {
-            token,
-            auth_header,
             page: Page::Dashboard,
             index_data: Value::Null,
             neighbour_data: Value::Null,
@@ -130,7 +121,6 @@ impl App {
             dmz_ip_input: String::new(),
             band_lock_state: BandLockState::new(),
             status_message: String::new(),
-            last_refresh_request: Instant::now(),
             request_tx,
             neighbour_fetched: false,
             last_dashboard_time: None,
@@ -287,7 +277,7 @@ async fn run_handlers(
                 };
                 let _ = resp_tx.send(Response::NeighborData { data, error });
             }
-            Request::SetBandLock { index: _, earfcn } => {
+            Request::SetBandLock { earfcn } => {
                 let command = format!("set_band_lock {}", earfcn);
                 let result = api_request(&auth_header, &command).await;
                 let msg = match result {
@@ -298,10 +288,7 @@ async fn run_handlers(
                     ),
                     Err(e) => format!("Error: {}", e),
                 };
-                let _ = resp_tx.send(Response::BandLockResult {
-                    earfcn,
-                    result: msg,
-                });
+                let _ = resp_tx.send(Response::BandLockResult { result: msg });
             }
             Request::SetDmz { ip } => {
                 let command = format!("set_dmz 1 tcpudp {}", ip);
@@ -380,7 +367,7 @@ fn draw_dashboard(f: &mut Frame, app: &mut App) {
     let binding = app.rsrp_history.make_contiguous();
     let rsrp_sparkline = Sparkline::default()
         .block(Block::default().title("RSRP (dBm)").borders(Borders::ALL))
-        .data(&binding)
+        .data(binding)
         .style(Style::default().fg(Color::Yellow));
     f.render_widget(rsrp_sparkline, right_chunks[0]);
 
@@ -411,7 +398,7 @@ fn draw_dashboard(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(sys_text).block(sys_block), right_chunks[3]);
 }
 
-fn build_connection_text(data: &Value) -> Text {
+fn build_connection_text(data: &Value) -> Text<'_> {
     let mut lines = vec![];
     add_line(&mut lines, "Type", data, "TYPE");
     add_line(&mut lines, "Band", data, "BAND");
@@ -441,7 +428,7 @@ fn build_connection_text(data: &Value) -> Text {
     Text::from(lines)
 }
 
-fn build_cell_text(data: &Value) -> Text {
+fn build_cell_text(data: &Value) -> Text<'_> {
     let mut lines = vec![];
     add_line(&mut lines, "Modem Call Control", data, "MCC");
     add_line(&mut lines, "MNC", data, "MNC");
@@ -453,7 +440,7 @@ fn build_cell_text(data: &Value) -> Text {
     Text::from(lines)
 }
 
-fn build_data_usage_text(app: &App) -> Text {
+fn build_data_usage_text(app: &App) -> Text<'_> {
     let mut lines = vec![];
     let current_rx = app.index_data["recieve"]
         .as_str()
@@ -489,7 +476,7 @@ fn build_data_usage_text(app: &App) -> Text {
     Text::from(lines)
 }
 
-fn build_system_text(data: &Value) -> Text {
+fn build_system_text(data: &Value) -> Text<'_> {
     let mut lines = vec![];
     add_line(&mut lines, "Model", data, "model");
     add_line(&mut lines, "Serial", data, "serial");
@@ -693,7 +680,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 // ---------- main TUI loop ----------
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let (token, auth_header) = authenticate().await?;
+    let (_, auth_header) = authenticate().await?;
 
     let (worker_tx, request_rx) =
         mpsc::unbounded_channel::<(Request, mpsc::UnboundedSender<Response>)>();
@@ -715,7 +702,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(token, auth_header.clone(), worker_tx.clone());
+    let mut app = App::new(worker_tx.clone());
 
     send_request(&app.request_tx, &response_tx, Request::RefreshDashboard);
 
@@ -752,7 +739,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         app.status_message = "Neighbour cells fetched".into();
                     }
                 }
-                Response::BandLockResult { result, .. } => {
+                Response::BandLockResult { result } => {
                     app.band_lock_response = Some(result);
                 }
                 Response::DmzResult(result) => {
@@ -794,20 +781,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                             KeyCode::Tab => {
                                 app.next_page();
-                                if matches!(app.page, Page::NeighborCells) && !app.neighbour_fetched {
+                                if matches!(app.page, Page::NeighborCells) && !app.neighbour_fetched
+                                {
                                     app.neighbour_fetched = true;
                                     send_request(
                                         &app.request_tx,
                                         &response_tx,
                                         Request::FetchNeighbors,
-                                    );  
+                                    );
                                 }
                             }
-                            KeyCode::Char(c) => {
-                                // Allow digits and dots only (simple IP input)
-                                if c.is_ascii_digit() || c == '.' {
-                                    app.dmz_ip_input.push(c);
-                                }
+                            // Allow digits and dots only (simple IP input)
+                            KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+                                app.dmz_ip_input.push(c);
                             }
                             _ => {}
                         }
@@ -881,10 +867,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 send_request(
                                     &app.request_tx,
                                     &response_tx,
-                                    Request::SetBandLock {
-                                        index: selected,
-                                        earfcn,
-                                    },
+                                    Request::SetBandLock { earfcn },
                                 );
                                 app.band_lock_response = Some("Sending...".to_string());
                             }
